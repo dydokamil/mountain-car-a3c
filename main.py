@@ -1,161 +1,288 @@
-import glob
-import itertools
-import os
-import random
-from collections import deque
+# coding: utf-8
 
+# Credit: https://github.com/awjuliani/DeepRL-Agents/blob/master/A3C-Doom.ipynb
+
+import os
+import threading
+from time import sleep
+
+import cv2
 import gym
 import numpy as np
-from cv2 import cv2
-from keras.layers import Convolution2D, Dense, Flatten
-from keras.models import Sequential
-from keras.optimizers import RMSprop
+import scipy.signal
+import tensorflow as tf
 
-BATCH_SIZE = 32
-EPSILON_DECAY = .99
-MIN_EPSILON = .05
-GAMMA = .95
+from A3CNetwork import A3CNetwork
+# ### Helper Functions
+from common import s_size, a_size
 
-epsilon = 1.
-D = deque(maxlen=64000)
-render = False
-best = -20.
-
-DISCRETIZATION_LEVELS = (4, 3, 3)
-as1 = np.linspace(-1, 1, DISCRETIZATION_LEVELS[0])
-as2 = np.linspace(0, 1, DISCRETIZATION_LEVELS[1])
-as3 = np.linspace(0, 1, DISCRETIZATION_LEVELS[2])
-POSSIBLE_ACTIONS = np.asarray([x for x in itertools.product(as1, as2, as3)])
-print("Possible actions:", len(POSSIBLE_ACTIONS))
+main_lock = threading.Lock()
+action_high = [1, 1, 1]
+action_low = [-1, 0, 0]
 
 
-def get_model():
-    model = Sequential()
-    model.add(Convolution2D(64, 8, strides=(4, 4), padding='same',
-                            activation='relu',
-                            input_shape=(96, 96, 4)))
-    model.add(Convolution2D(64, 4, strides=(2, 2), padding='same',
-                            activation='relu'))
-    model.add(Convolution2D(64, 3, padding='same',
-                            activation='relu'))
-    model.add(Flatten())
-    model.add(Dense(512, activation='relu'))
-    model.add(Dense(256, activation='relu'))
-    model.add(Dense(len(POSSIBLE_ACTIONS)))
-
-    optimizer = RMSprop()
-    model.compile(loss='mse', optimizer=optimizer)
-
-    return model
-
-
-def save_exp_replay(s, a, r, s_prime, t):
-    D.append([s, a, r, s_prime, t])
-
-
-def get_exp_replay():
-    try:
-        return random.sample(D, BATCH_SIZE)
-    except ValueError:
-        return None
-
-
-def discount_epsilon():
-    global epsilon
-    epsilon *= EPSILON_DECAY
-    if epsilon < MIN_EPSILON:
-        epsilon = MIN_EPSILON
-
-
-def choose_action(s, model):
-    s = np.expand_dims(s, axis=0)
-    if np.random.rand() < epsilon:
-        return random.choice(POSSIBLE_ACTIONS)
-    else:
-        return POSSIBLE_ACTIONS[np.argmax(model.predict(s))]
-
+# TODO add image cropping and reduce conv size
 
 def img_to_gray(img):
-    return cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    return np.array(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).flatten()
+
+
+# Copies one set of variables to another.
+# Used to set worker network parameters to those of global network.
+def update_target_graph(from_scope, to_scope):
+    from_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, from_scope)
+    to_vars = tf.get_collection(tf.GraphKeys.TRAINABLE_VARIABLES, to_scope)
+
+    op_holder = []
+    for from_var, to_var in zip(from_vars, to_vars):
+        op_holder.append(to_var.assign(from_var))
+    return op_holder
+
+
+# Discounting function used to calculate discounted returns.
+# TODO normalize rewards?
+def discount(x, gamma):
+    return scipy.signal.lfilter([1], [1, -gamma], x[::-1], axis=0)[::-1]
+
+
+# ### Worker Agent
+class Worker:
+    def __init__(self, game, name, s_size, a_size, trainer, model_path,
+                 global_episodes):
+        self.name = "worker_" + str(name)
+        self.number = name
+        self.model_path = model_path
+        self.trainer = trainer
+        self.global_episodes = global_episodes
+        self.increment = self.global_episodes.assign_add(1)
+        self.episode_rewards = []
+        self.episode_lengths = []
+        self.episode_mean_values = []
+        self.summary_writer = tf.summary.FileWriter(
+            "train_" + str(self.number))
+
+        # Create the local copy of the network and the TensorFlow op
+        # to copy global parameters to local network
+        self.local_AC = A3CNetwork(s_size, a_size, self.name, trainer)
+        self.update_local_ops = update_target_graph('global', self.name)
+
+        self.actions = self.actions = np.identity(a_size, dtype=bool).tolist()
+        self.env = game
+
+    def train(self, rollout, sess, gamma, bootstrap_value):
+        rollout = np.array(rollout)
+        observations = rollout[:, 0]
+        actions = rollout[:, 1]
+        rewards = rollout[:, 2]
+        values = rollout[:, 5]
+
+        # Here we take the rewards and values from the rollout, and use them to
+        # generate the advantage and discounted returns.
+        # The advantage function uses "Generalized Advantage Estimation"
+        self.rewards_plus = np.asarray(rewards.tolist() + [bootstrap_value])
+        discounted_rewards = discount(self.rewards_plus, gamma)[:-1]
+        self.value_plus = np.asarray(values.tolist() + [bootstrap_value])
+        advantages = \
+            rewards + gamma * self.value_plus[1:] - self.value_plus[:-1]
+        advantages = discount(advantages, gamma)
+
+        # Update the global network using gradients from loss
+        # Generate network statistics to periodically save
+        feed_dict = {self.local_AC.target_v: discounted_rewards,
+                     self.local_AC.inputs: np.vstack(observations),
+                     # self.local_AC.actions: actions,
+                     self.local_AC.advantages: advantages,
+                     self.local_AC.state_in[0]: self.batch_rnn_state[0],
+                     self.local_AC.state_in[1]: self.batch_rnn_state[1]}
+        # with tf.device('/gpu:0'):
+        v_l, p_l, e_l, g_n, v_n, self.batch_rnn_state, _ = sess.run(
+            [self.local_AC.value_loss,
+             self.local_AC.policy_loss,
+             self.local_AC.entropy,
+             self.local_AC.grad_norms,
+             self.local_AC.var_norms,
+             self.local_AC.state_out,
+             self.local_AC.apply_grads],
+            feed_dict=feed_dict)
+        return (v_l / len(rollout), p_l / len(rollout),
+                e_l / len(rollout), g_n, v_n)
+
+    def work(self, max_episode_length, gamma, sess, coord, saver):
+        episode_count = sess.run(self.global_episodes)
+        total_steps = 0
+        print("Starting worker " + str(self.number))
+        with sess.as_default(), sess.graph.as_default():
+            while not coord.should_stop():
+                sess.run(self.update_local_ops)
+                episode_buffer = []
+                episode_values = []
+                episode_reward = 0
+                episode_step_count = 0
+
+                with main_lock:
+                    s = self.env.reset()
+                s = img_to_gray(s)
+                rnn_state = self.local_AC.state_init
+                self.batch_rnn_state = rnn_state
+                d = False
+                while not d:
+                    # Take an action using probabilities
+                    # from policy network output.
+                    a_dist, v, rnn_state = sess.run(
+                        [self.local_AC.normal_dist, self.local_AC.value,
+                         self.local_AC.state_out],
+                        feed_dict={self.local_AC.inputs: [s],
+                                   self.local_AC.state_in[0]: rnn_state[0],
+                                   self.local_AC.state_in[1]: rnn_state[1]})
+
+                    a = a_dist.squeeze()
+                    a = np.clip(a, a_min=action_low,
+                                a_max=action_high)
+
+                    with main_lock:
+                        s1, r, d, _ = self.env.step(a)
+                    s1 = img_to_gray(s1)
+
+                    r /= 100.
+
+                    if d:
+                        s1 = s
+
+                    episode_buffer.append([s, a, r, s1, d, v[0, 0]])
+                    episode_values.append(v[0, 0])
+
+                    episode_reward += r
+                    s = s1
+                    total_steps += 1
+                    episode_step_count += 1
+
+                    # If the episode hasn't ended,
+                    # but the experience buffer is full, then we make an update
+                    # step using that experience rollout.
+                    # TODO remove batch training and value bootstraping
+                    if len(episode_buffer) == 30 \
+                            and not d \
+                            and episode_step_count != max_episode_length - 1:
+                        # Since we don't know what the true final return is,
+                        # we "bootstrap" from our current
+                        # value estimation.
+                        feed_dict = {self.local_AC.inputs: [s],
+                                     self.local_AC.state_in[0]: rnn_state[0],
+                                     self.local_AC.state_in[1]: rnn_state[1]}
+                        v1 = sess.run(self.local_AC.value,
+                                      feed_dict=feed_dict)[0, 0]
+                        v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer,
+                                                             sess, gamma, v1)
+                        episode_buffer = []
+                        sess.run(self.update_local_ops)
+                    if d:
+                        break
+
+                self.episode_rewards.append(episode_reward)
+                print('reward:', episode_reward)
+                self.episode_lengths.append(episode_step_count)
+                self.episode_mean_values.append(np.mean(episode_values))
+
+                # Update the network using the episode buffer
+                # at the end of the episode.
+                if len(episode_buffer) != 0:
+                    v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer,
+                                                         sess,
+                                                         gamma,
+                                                         0.0)
+
+                # Periodically save model parameters, and summary statistics.
+                if episode_count % 5 == 0 and episode_count != 0:
+                    if episode_count % 250 == 0 and self.name == 'worker_0':
+                        saver.save(sess, self.model_path + '/model-' + str(
+                            episode_count) + '.ckpt')
+                        print("Saved Model")
+
+                    mean_reward = np.mean(self.episode_rewards[-5:])
+                    if mean_reward >= MAX_REWARD * .99:
+                        saver.save(sess, self.model_path + '/model-' + str(
+                            episode_count) + '.ckpt')
+                        print("Saved Model")
+
+                        coord.request_stop()  # STOP
+                    print("Mean reward:", mean_reward)
+                    mean_length = np.mean(self.episode_lengths[-5:])
+                    mean_value = np.mean(self.episode_mean_values[-5:])
+                    # summary = tf.Summary()
+                    # summary.value.add(tag='Perf/Reward',
+                    #                   simple_value=float(mean_reward))
+                    # summary.value.add(tag='Perf/Length',
+                    #                   simple_value=float(mean_length))
+                    # summary.value.add(tag='Perf/Value',
+                    #                   simple_value=float(mean_value))
+                    # summary.value.add(tag='Losses/Value Loss',
+                    #                   simple_value=float(v_l))
+                    # summary.value.add(tag='Losses/Policy Loss',
+                    #                   simple_value=float(p_l))
+                    # summary.value.add(tag='Losses/Entropy',
+                    #                   simple_value=float(e_l))
+                    # summary.value.add(tag='Losses/Grad Norm',
+                    #                   simple_value=float(g_n))
+                    # summary.value.add(tag='Losses/Var Norm',
+                    #                   simple_value=float(v_n))
+                    # self.summary_writer.add_summary(summary, episode_count)
+
+                    self.summary_writer.flush()
+                if self.name == 'worker_0':
+                    sess.run(self.increment)
+                episode_count += 1
 
 
 if __name__ == '__main__':
-    env = gym.make("CarRacing-v0")
-    env.reset()
+    max_episode_length = 300
+    gamma = .99  # discount rate for advantage estimation and reward
+    model_path = './model'
+    MAX_REWARD = 1e5
 
-    model = get_model()
-    episode = 0
-    while True:
-        print("Episode", episode)
-        s = env.reset()
+    tf.reset_default_graph()
 
-        i = 0
-        total_reward = 0
-        s = img_to_gray(s)
-        s = np.stack((s, s, s, s), axis=2)
-        terminated = False
-        while not terminated:
-            if render:
-                env.render()
-            a = choose_action(s, model)
-            s_prime, r, terminated, _ = env.step(a)
+    if not os.path.exists(model_path):
+        os.makedirs(model_path)
 
-            s_prime = img_to_gray(s_prime)
-            s_prime = np.expand_dims(s_prime, axis=2)
+    with tf.device("/cpu:0"):
+        global_episodes = tf.Variable(0, dtype=tf.int32,
+                                      name='global_episodes',
+                                      trainable=False)
+        trainer = tf.train.AdamOptimizer()
+        # Generate global network
+        master_network = A3CNetwork(s_size, a_size, 'global', None)
+        # Set workers ot number of available CPU threads
+        # num_workers = multiprocessing.cpu_count()
+        num_workers = 4
+        workers = []
+        # Create worker classes
+        for i in range(num_workers):
+            workers.append(
+                Worker(gym.make("CarRacing-v0"), i, s_size, a_size, trainer,
+                       model_path, global_episodes))
+        saver = tf.train.Saver(max_to_keep=5)
 
-            s_prime = np.dstack((s[:, :, 1:], s_prime))
-            save_exp_replay(s, a, r, s_prime, terminated)
-            s = s_prime
-            i += 1
-            total_reward += r
+    with tf.Session() as sess:
+        coord = tf.train.Coordinator()
+        sess.run(tf.global_variables_initializer())
 
-        print("Total reward:", total_reward, '. Epsilon:', epsilon)
-        render = total_reward >= 0.  # render?
+        # This is where the asynchronous magic happens.
+        # Start the "work" process for each worker in a separate threat.
+        worker_threads = []
 
-        if total_reward >= best:
-            best = total_reward
 
-            # delete the previous model
-            saved_model = glob.glob('*.h5')[0]
-            os.remove(saved_model)
+        def worker_work(w): return w.work(max_episode_length,
+                                          gamma,
+                                          sess, coord, saver)
 
-            # save the model
-            print("Saving the model with a score of", best)
-            model.save(f'model_{best}.h5')
 
-        episode += 1
-        # training
-        batch = get_exp_replay()
-        if batch is None:
-            continue
+        for worker in workers:
+            def worker_work(): worker.work(max_episode_length, gamma,
+                                           sess, coord, saver)
 
-        X = np.zeros((len(batch), 96, 96, 4))
-        y = np.zeros((len(batch), len(POSSIBLE_ACTIONS)))
 
-        for idx, (ss, aa, rr, ss_prime, terminated) in enumerate(batch):
-            """
-            1. Do a feedforward pass for the current state s to get predicted 
-                Q-values for all actions.
-            2. Do a feedforward pass for the next state s’ and calculate 
-                maximum overall network outputs max a’ Q(s’, a’).
-            3. Set Q-value target for action to r + γmax a’ Q(s’, a’) 
-                For all other actions, set the Q-value target to the same as 
-                originally returned from step 1.
-            4. Update the weights using backpropagation.
-            """
-            X[idx] = ss
-            Q_sa = model.predict(np.expand_dims(ss, axis=0))
-            Q_sa_prime = model.predict(np.expand_dims(ss_prime, axis=0))
-
-            if terminated:
-                tt = r
-            else:
-                tt = r + GAMMA * np.max(Q_sa_prime[0])
-
-            action_index = np.where(POSSIBLE_ACTIONS == aa)[0][0]
-            Q_sa[0][action_index] = tt
-            y[idx] = Q_sa
-
-        model.train_on_batch(X, y)
-        print("Trained on a batch.")
-        discount_epsilon()
+            t = threading.Thread(target=worker_work)
+            t.start()
+            sleep(0.5)
+            worker_threads.append(t)
+        coord.join(worker_threads)
