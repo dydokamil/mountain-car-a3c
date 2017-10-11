@@ -1,2 +1,2 @@
-s_size = 96 * 96  # image observation
-a_size = 3  # continuous action space
+s_size = 2 # image observation
+a_size = 1  # continuous action space

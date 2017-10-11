@@ -6,7 +6,6 @@ import os
 import threading
 from time import sleep
 
-import cv2
 import gym
 import numpy as np
 import scipy.signal
@@ -17,14 +16,8 @@ from A3CNetwork import A3CNetwork
 from common import s_size, a_size
 
 main_lock = threading.Lock()
-action_high = [1, 1, 1]
-action_low = [-1, 0, 0]
-
-
-# TODO add image cropping and reduce conv size
-
-def img_to_gray(img):
-    return np.array(cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)).flatten()
+action_high = [1]
+action_low = [-1]
 
 
 # Copies one set of variables to another.
@@ -95,17 +88,19 @@ class Worker:
                      self.local_AC.state_in[0]: self.batch_rnn_state[0],
                      self.local_AC.state_in[1]: self.batch_rnn_state[1]}
         # with tf.device('/gpu:0'):
-        v_l, p_l, e_l, g_n, v_n, self.batch_rnn_state, _ = sess.run(
+        v_l, l_l, e_l, g_n, v_n, self.batch_rnn_state, _ = sess.run(
             [self.local_AC.value_loss,
-             self.local_AC.policy_loss,
+             self.local_AC.loss,
              self.local_AC.entropy,
              self.local_AC.grad_norms,
              self.local_AC.var_norms,
              self.local_AC.state_out,
              self.local_AC.apply_grads],
             feed_dict=feed_dict)
-        return (v_l / len(rollout), p_l / len(rollout),
-                e_l / len(rollout), g_n, v_n)
+        print("Loss:", np.mean(l_l))
+        # print("Trained.")
+        # return (v_l / len(rollout), p_l / len(rollout),
+        #         e_l / len(rollout), g_n, v_n)
 
     def work(self, max_episode_length, gamma, sess, coord, saver):
         episode_count = sess.run(self.global_episodes)
@@ -121,7 +116,6 @@ class Worker:
 
                 with main_lock:
                     s = self.env.reset()
-                s = img_to_gray(s)
                 rnn_state = self.local_AC.state_init
                 self.batch_rnn_state = rnn_state
                 d = False
@@ -141,7 +135,8 @@ class Worker:
 
                     with main_lock:
                         s1, r, d, _ = self.env.step(a)
-                    s1 = img_to_gray(s1)
+                        if self.name == 'worker_0':
+                            self.env.render()
 
                     r /= 100.
 
@@ -160,36 +155,32 @@ class Worker:
                     # but the experience buffer is full, then we make an update
                     # step using that experience rollout.
                     # TODO remove batch training and value bootstraping
-                    if len(episode_buffer) == 30 \
-                            and not d \
-                            and episode_step_count != max_episode_length - 1:
-                        # Since we don't know what the true final return is,
-                        # we "bootstrap" from our current
-                        # value estimation.
-                        feed_dict = {self.local_AC.inputs: [s],
-                                     self.local_AC.state_in[0]: rnn_state[0],
-                                     self.local_AC.state_in[1]: rnn_state[1]}
-                        v1 = sess.run(self.local_AC.value,
-                                      feed_dict=feed_dict)[0, 0]
-                        v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer,
-                                                             sess, gamma, v1)
-                        episode_buffer = []
-                        sess.run(self.update_local_ops)
-                    if d:
-                        break
+                    # if len(episode_buffer) == 30 \
+                    #         and not d \
+                    #         and episode_step_count != max_episode_length - 1:
+                    #     # Since we don't know what the true final return is,
+                    #     # we "bootstrap" from our current
+                    #     # value estimation.
+                    #     feed_dict = {self.local_AC.inputs: [s],
+                    #                  self.local_AC.state_in[0]: rnn_state[0],
+                    #                  self.local_AC.state_in[1]: rnn_state[1]}
+                    #     v1 = sess.run(self.local_AC.value,
+                    #                   feed_dict=feed_dict)[0, 0]
+                    #     v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer,
+                    #                                          sess, gamma, v1)
+                    #     episode_buffer = []
+                    #     sess.run(self.update_local_ops)
+                    # if d:
+                    #     break
 
                 self.episode_rewards.append(episode_reward)
-                print('reward:', episode_reward)
                 self.episode_lengths.append(episode_step_count)
                 self.episode_mean_values.append(np.mean(episode_values))
 
                 # Update the network using the episode buffer
                 # at the end of the episode.
                 if len(episode_buffer) != 0:
-                    v_l, p_l, e_l, g_n, v_n = self.train(episode_buffer,
-                                                         sess,
-                                                         gamma,
-                                                         0.0)
+                    self.train(episode_buffer, sess, gamma, 0.0)
 
                 # Periodically save model parameters, and summary statistics.
                 if episode_count % 5 == 0 and episode_count != 0:
@@ -206,28 +197,6 @@ class Worker:
 
                         coord.request_stop()  # STOP
                     print("Mean reward:", mean_reward)
-                    mean_length = np.mean(self.episode_lengths[-5:])
-                    mean_value = np.mean(self.episode_mean_values[-5:])
-                    # summary = tf.Summary()
-                    # summary.value.add(tag='Perf/Reward',
-                    #                   simple_value=float(mean_reward))
-                    # summary.value.add(tag='Perf/Length',
-                    #                   simple_value=float(mean_length))
-                    # summary.value.add(tag='Perf/Value',
-                    #                   simple_value=float(mean_value))
-                    # summary.value.add(tag='Losses/Value Loss',
-                    #                   simple_value=float(v_l))
-                    # summary.value.add(tag='Losses/Policy Loss',
-                    #                   simple_value=float(p_l))
-                    # summary.value.add(tag='Losses/Entropy',
-                    #                   simple_value=float(e_l))
-                    # summary.value.add(tag='Losses/Grad Norm',
-                    #                   simple_value=float(g_n))
-                    # summary.value.add(tag='Losses/Var Norm',
-                    #                   simple_value=float(v_n))
-                    # self.summary_writer.add_summary(summary, episode_count)
-
-                    self.summary_writer.flush()
                 if self.name == 'worker_0':
                     sess.run(self.increment)
                 episode_count += 1
@@ -258,7 +227,7 @@ if __name__ == '__main__':
         # Create worker classes
         for i in range(num_workers):
             workers.append(
-                Worker(gym.make("CarRacing-v0"), i, s_size, a_size, trainer,
+                Worker(gym.make("MountainCarContinuous-v0"), i, s_size, a_size, trainer,
                        model_path, global_episodes))
         saver = tf.train.Saver(max_to_keep=5)
 
