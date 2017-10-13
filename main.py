@@ -13,11 +13,9 @@ import tensorflow as tf
 
 from A3CNetwork import A3CNetwork
 # ### Helper Functions
-from common import s_size, a_size
+from common import s_size, a_size, action_low, action_high
 
 main_lock = threading.Lock()
-action_high = [1]
-action_low = [-1]
 epsilon = .05
 
 
