@@ -15,17 +15,13 @@ class A3CNetwork:
                                          dtype=tf.float32, name='inputs')
 
             W_h1 = weight_variable('W_h1',
-                                   shape=[2, 64])
+                                   shape=[2, 200])
             b_h1 = weight_variable('b_h1',
-                                   shape=[64])
+                                   shape=[200])
             h1 = tf.nn.elu(tf.matmul(self.inputs, W_h1) + b_h1)
 
-            W_h2 = weight_variable('W_h2', [64, 64])
-            b_h2 = weight_variable('b_h2', [64])
-            h2 = tf.nn.elu(tf.matmul(h1, W_h2) + b_h2)
-
             # Recurrent network for temporal dependencies
-            lstm_cell = tf.contrib.rnn.BasicLSTMCell(64, state_is_tuple=True)
+            lstm_cell = tf.contrib.rnn.BasicLSTMCell(128, state_is_tuple=True)
             c_init = np.zeros((1, lstm_cell.state_size.c), np.float32)
             h_init = np.zeros((1, lstm_cell.state_size.h), np.float32)
             self.state_init = [c_init, h_init]
@@ -34,7 +30,7 @@ class A3CNetwork:
             h_in = tf.placeholder(tf.float32, [1, lstm_cell.state_size.h],
                                   name='h_in')
             self.state_in = (c_in, h_in)
-            rnn_in = tf.expand_dims(h2, [0])
+            rnn_in = tf.expand_dims(h1, [0])
             step_size = tf.shape(self.inputs)[:1]
             state_in = tf.contrib.rnn.LSTMStateTuple(c_in, h_in)
             lstm_outputs, lstm_state = tf.nn.dynamic_rnn(
@@ -43,13 +39,13 @@ class A3CNetwork:
                 time_major=False)
             lstm_c, lstm_h = lstm_state
             self.state_out = (lstm_c[:1, :], lstm_h[:1, :])
-            rnn_out = tf.reshape(lstm_outputs, [-1, 64])
+            rnn_out = tf.reshape(lstm_outputs, [-1, 128])
 
-            W_mu = weight_variable('W_mu', [64, a_size])
+            W_mu = weight_variable('W_mu', [128, a_size])
             b_mu = weight_variable('b_mu', [a_size])
             self.mu = tf.matmul(rnn_out, W_mu) + b_mu
 
-            W_sigma = weight_variable('W_sigma', [64, a_size])
+            W_sigma = weight_variable('W_sigma', [128, a_size])
             b_sigma = weight_variable('b_sigma', [a_size])
             self.sigma = tf.nn.softplus(
                 tf.matmul(rnn_out, W_sigma) + b_sigma)
@@ -58,7 +54,7 @@ class A3CNetwork:
                                                 mean=self.mu,
                                                 stddev=self.sigma)
 
-            W_value = weight_variable('W_value', [64, 1])
+            W_value = weight_variable('W_value', [128, 1])
             b_value = weight_variable('b_value', [1])
             self.value = tf.matmul(rnn_out, W_value) + b_value
 
@@ -82,7 +78,7 @@ class A3CNetwork:
                                  * (self.normal_dist - self.mu)
                                  * tf.pow((2. * self.sigma), -1))
 
-                self.entropy = -.5 * (tf.log(2. * np.pi * self.sigma) + 1.)
+                self.entropy = .5 * (tf.log(2. * np.pi * self.sigma) + 1.)
 
                 self.advantages_tiled = tf.tile(self.advantages, [a_size])
                 self.advantages_tiled = tf.reshape(self.advantages_tiled, [-1, a_size])
